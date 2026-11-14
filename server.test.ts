@@ -1,6 +1,6 @@
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { PluginAgentConfigurationContext } from "@get-bb/plugin-sdk";
 import {
   createFakePluginHost,
@@ -11,6 +11,7 @@ import plugin from "./server";
 
 const disposals: Array<() => Promise<void>> = [];
 afterEach(async () => {
+  vi.useRealTimers();
   while (disposals.length) await disposals.pop()!();
 });
 
@@ -31,6 +32,7 @@ async function setup() {
   let sendFailures = 0;
   let getFailures = new Map<string, number>();
   let updateFailures = new Map<string, number>();
+  const missingProjects = new Set<string>();
   const live = new Map<string, ReturnType<typeof makeThreadResponse>>();
   const sent: any[] = [];
   const spawned: any[] = [];
@@ -43,7 +45,10 @@ async function setup() {
         create: async ({ name }: { name: string }) => section = { id: "sec_chief", name, createdAt: 1, updatedAt: 1 },
       },
       projects: {
-        get: async ({ projectId }: { projectId: string }) => ({ id: projectId, name: projectId === "proj_1" ? "Asha" : "Second", kind: "standard" }),
+        get: async ({ projectId }: { projectId: string }) => {
+          if (missingProjects.has(projectId)) throw new Error("HTTP 404: Project not found");
+          return { id: projectId, name: projectId === "proj_1" ? "Asha" : "Second", kind: "standard" };
+        },
         fileContent: async () => { throw new Error("missing"); },
       },
       hosts: { list: async () => [{ id: "host_1", name: "Local", status: "connected" }] },
@@ -114,6 +119,7 @@ async function setup() {
     sent,
     live,
     section: () => section,
+    markProjectMissing(projectId: string) { missingProjects.add(projectId); },
     failNextGet(threadId: string) { getFailures.set(threadId, (getFailures.get(threadId) ?? 0) + 1); },
     failNextUpdate(threadId: string) { updateFailures.set(threadId, (updateFailures.get(threadId) ?? 0) + 1); },
     failNextSend() { sendFailures += 1; },
@@ -290,6 +296,14 @@ describe("Chief backend", () => {
     expect(state.live.get(worker.threadId)).toMatchObject({ sectionId: "sec_chief", visibility: "visible" });
   });
 
+  test("marks a managed thread that no longer exists as deleted instead of retrying forever", async () => {
+    const state = await setup();
+    const worker = await delegate(state, (await start(state)).threadId);
+    state.live.delete(worker.threadId);
+    await state.supervisorCycle();
+    expect((await status(state)).threads.find((row) => row.threadId === worker.threadId)?.state).toBe("deleted");
+  });
+
   test("persists failed notifications and retries them before reporting delivery", async () => {
     const state = await setup();
     const chief = await start(state);
@@ -403,6 +417,71 @@ describe("Chief backend", () => {
     const service = state.harness.behavior.runService("supervisor");
     service.controller.abort();
     await expect(service.done).resolves.toBeUndefined();
+  });
+
+  test("backs off and then pauses automatic Chief restarts after repeated start failures", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const state = await setup();
+    await start(state);
+    expect(state.spawned).toHaveLength(1);
+
+    async function failLatestChief() {
+      const row = (await status(state)).threads.filter((entry) => entry.role === "chief").at(-1)!;
+      state.live.set(row.threadId, { ...state.live.get(row.threadId)!, status: "error" });
+      await state.supervisorCycle();
+    }
+    function advance(ms: number) {
+      vi.setSystemTime(new Date(Date.now() + ms));
+    }
+
+    // The first failed Chief is replaced immediately, then the backoff holds the next attempt.
+    await failLatestChief();
+    expect(state.spawned).toHaveLength(2);
+    await failLatestChief();
+    expect(state.spawned).toHaveLength(2);
+    advance(59_000);
+    await state.supervisorCycle();
+    expect(state.spawned).toHaveLength(2);
+
+    // Each persisted failure doubles the delay: 60s, 120s, 240s, 480s.
+    for (const [index, delay] of [60_000, 120_000, 240_000, 480_000].entries()) {
+      advance(delay);
+      await state.supervisorCycle();
+      expect(state.spawned).toHaveLength(3 + index);
+      await failLatestChief();
+    }
+
+    // The fifth consecutive failure pauses automatic starts for good.
+    expect(state.spawned).toHaveLength(6);
+    advance(24 * 60 * 60_000);
+    await state.supervisorCycle();
+    await state.supervisorCycle();
+    expect(state.spawned).toHaveLength(6);
+    const reported = JSON.parse((await state.harness.behavior.runCli(["status", "--project", "proj_1", "--json"])).stdout!);
+    expect(reported.restart).toMatchObject({ paused: true, failures: 5 });
+
+    // An explicit start is the operator's way back in: it clears the pause.
+    await start(state, "proj_1");
+    expect(state.spawned).toHaveLength(7);
+  });
+
+  test("does not restart a Chief for a project that no longer exists", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const state = await setup();
+    await start(state);
+    const chief = (await status(state)).threads.find((row) => row.role === "chief")!;
+    state.live.set(chief.threadId, { ...state.live.get(chief.threadId)!, status: "error" });
+    await state.supervisorCycle();
+    expect(state.spawned).toHaveLength(2);
+
+    state.markProjectMissing("proj_1");
+    const failed = (await status(state)).threads.filter((row) => row.role === "chief").at(-1)!;
+    state.live.set(failed.threadId, { ...state.live.get(failed.threadId)!, status: "error" });
+    await state.supervisorCycle();
+    vi.setSystemTime(new Date(Date.now() + 120_000));
+    await state.supervisorCycle();
+    await state.supervisorCycle();
+    expect(state.spawned).toHaveLength(2);
   });
 
   test("imports only public SDK surfaces", async () => {

@@ -10,6 +10,10 @@ import { z } from "zod";
 const SECTION_NAME = "Chief";
 const RULES_FILE = "chief.md";
 const RECONCILE_INTERVAL_MS = 30_000;
+const CHIEF_RESTART_BASE_DELAY_MS = 60_000;
+const CHIEF_RESTART_MAX_DELAY_MS = 30 * 60_000;
+const MAX_CONSECUTIVE_CHIEF_START_FAILURES = 5;
+const TERMINAL_CHIEF_STATES = new Set(["failed", "deleted", "archived", "complete"]);
 const MAX_ALERT_LENGTH = 3_000;
 const MAX_RESULT_LENGTH = 8_000;
 const BUSY_STATUSES = new Set(["active", "starting", "stopping", "pending"]);
@@ -165,6 +169,10 @@ function parseArgs(argv: string[]) {
 
 function clip(value: string, limit = MAX_ALERT_LENGTH) {
   return value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
+}
+
+function isMissingThreadError(error: unknown) {
+  return error instanceof Error && /\b404\b|not found/i.test(error.message);
 }
 
 function bullets(values?: string[]) {
@@ -398,6 +406,99 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function createChief(projectId: string) {
     return spawnChief(projectId);
+  }
+
+  type ChiefRestartState = {
+    failures: number;
+    retryAt: number;
+    paused: boolean;
+    pendingThreadId: string | null;
+  };
+
+  const restartKey = (projectId: string) => `chief_restart:${projectId}`;
+
+  function readChiefRestart(projectId: string): ChiefRestartState | null {
+    const row = db.prepare(`SELECT value FROM plugin_meta WHERE key=?`).get(restartKey(projectId)) as { value: string } | undefined;
+    if (!row) return null;
+    try {
+      return JSON.parse(row.value) as ChiefRestartState;
+    } catch {
+      return null;
+    }
+  }
+
+  function writeChiefRestart(projectId: string, state: ChiefRestartState) {
+    db.prepare(`INSERT INTO plugin_meta (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(restartKey(projectId), JSON.stringify(state));
+  }
+
+  function clearChiefRestart(projectId: string) {
+    db.prepare(`DELETE FROM plugin_meta WHERE key=?`).run(restartKey(projectId));
+  }
+
+  function chiefRestartDelay(failures: number) {
+    return Math.min(CHIEF_RESTART_BASE_DELAY_MS * 2 ** Math.max(failures - 1, 0), CHIEF_RESTART_MAX_DELAY_MS);
+  }
+
+  function recordChiefStartFailure(projectId: string, previous: ChiefRestartState | null, cause: string) {
+    const failures = (previous?.failures ?? 0) + 1;
+    const paused = failures >= MAX_CONSECUTIVE_CHIEF_START_FAILURES;
+    writeChiefRestart(projectId, {
+      failures,
+      retryAt: paused ? Number.MAX_SAFE_INTEGER : Date.now() + chiefRestartDelay(failures),
+      paused,
+      pendingThreadId: null,
+    });
+    if (paused) {
+      bb.log.warn(`Chief auto-start paused for ${projectId} after ${failures} failed starts (${cause}). Fix the cause, then run: bb chief start --project ${projectId}`);
+    } else {
+      bb.log.warn(`Chief start failed for ${projectId} (${failures}/${MAX_CONSECUTIVE_CHIEF_START_FAILURES}): ${cause}. Next automatic attempt in ${Math.round(chiefRestartDelay(failures) / 1000)}s.`);
+    }
+  }
+
+  /** A project that was deleted cannot host a Chief; starting one there would only fail. */
+  async function projectExists(projectId: string) {
+    try {
+      await bb.sdk.projects.get({ projectId });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Supervisor-side Chief start. Unlike an explicit `bb chief start`, it is skipped while a previous
+   * start is still cooling down, and stops entirely after repeated failures, so a permanent failure
+   * (for example an unresolvable model) cannot spawn a new Chief on every reconcile tick.
+   */
+  async function autoStartChief(projectId: string) {
+    let state = readChiefRestart(projectId);
+    if (state?.pendingThreadId) {
+      const pending = roles.get(state.pendingThreadId);
+      if (!pending) {
+        clearChiefRestart(projectId);
+        state = null;
+      } else if (pending.state === "failed") {
+        recordChiefStartFailure(projectId, state, `thread ${pending.thread_id} failed`);
+        state = readChiefRestart(projectId);
+      } else if (!["starting", "pending"].includes(pending.state)) {
+        clearChiefRestart(projectId);
+        state = null;
+      }
+    }
+    if (state?.paused) return;
+    if (state && Date.now() < state.retryAt) return;
+    const latest = latestChiefForProject.get(projectId) as ManagedRow | undefined;
+    if (latest && !TERMINAL_CHIEF_STATES.has(latest.state)) return;
+    if (!(await projectExists(projectId))) return;
+    try {
+      const result = await ensureChief(projectId);
+      if (result.created) {
+        writeChiefRestart(projectId, { failures: state?.failures ?? 0, retryAt: 0, paused: false, pendingThreadId: result.threadId });
+      }
+    } catch (error) {
+      recordChiefStartFailure(projectId, state, error instanceof Error ? error.message : String(error));
+    }
   }
 
   const chiefStarts = new Map<string, Promise<{ threadId: string; created: boolean }>>();
@@ -634,6 +735,11 @@ export default async function plugin(bb: BbPluginApi) {
     try {
       thread = await bb.sdk.threads.get({ threadId: row.thread_id });
     } catch (error) {
+      if (isMissingThreadError(error)) {
+        db.prepare(`UPDATE managed_threads SET state='deleted', status=NULL, active_since=NULL, updated_at=? WHERE thread_id=?`).run(Date.now(), row.thread_id);
+        reloadRoles();
+        return true;
+      }
       bb.log.warn(`Transient thread read failure for ${row.thread_id}; will retry: ${String(error)}`);
       return false;
     }
@@ -757,7 +863,7 @@ export default async function plugin(bb: BbPluginApi) {
               .map((row) => row.project_id),
           );
           if (values.chiefProject) chiefProjects.add(values.chiefProject);
-          for (const projectId of chiefProjects) await ensureChief(projectId);
+          for (const projectId of chiefProjects) await autoStartChief(projectId);
           // Replace terminal Chiefs and retarget their queued alerts before any
           // pending delivery is attempted.
           await retryAlerts();
@@ -771,6 +877,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   settings.onChange((next, previous) => {
     if (next.chiefProject && next.chiefProject !== previous.chiefProject) {
+      clearChiefRestart(next.chiefProject);
       void ensureChief(next.chiefProject).catch((error) => bb.log.warn(`Could not auto-start Chief: ${String(error)}`));
     }
   });
@@ -936,7 +1043,11 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.rpc.register(rpcContract, {
     status: () => ({ sectionId: storedSectionId(), threads: [...roles.values()].map(toManaged) }),
-    start: ({ projectId }) => ensureChief(projectId ?? undefined),
+    start: async ({ projectId }) => {
+      const target = projectId ?? (await settings.get()).chiefProject;
+      if (target) clearChiefRestart(target);
+      return ensureChief(projectId ?? undefined);
+    },
     create: ({ projectId }) => createChief(projectId),
   });
 
@@ -979,15 +1090,30 @@ export default async function plugin(bb: BbPluginApi) {
           const projectId = args.one("project") ?? context.projectId ?? (await settings.get()).chiefProject;
           if (!projectId) return fail("status requires --project outside a project thread");
           const rows = rosterFor(projectId, true).map(toManaged);
-          return ok({ sectionId: storedSectionId(), threads: rows }, rows.length ? rows.map((row) => `${row.role.padEnd(8)} ${row.state.padEnd(9)} ${row.title}  ${row.threadId}`).join("\n") : "Chief has no managed threads for this project.");
+          const restart = readChiefRestart(projectId);
+          const restartNote = !restart || (!restart.paused && restart.failures === 0)
+            ? null
+            : restart.paused
+              ? `Automatic Chief start is paused after ${restart.failures} failed starts. Fix the cause, then run: bb chief start --project ${projectId}`
+              : `Chief start failed ${restart.failures}x; the next automatic attempt is at ${new Date(restart.retryAt).toISOString()}.`;
+          return ok(
+            { sectionId: storedSectionId(), restart, threads: rows },
+            [
+              rows.length ? rows.map((row) => `${row.role.padEnd(8)} ${row.state.padEnd(9)} ${row.title}  ${row.threadId}`).join("\n") : "Chief has no managed threads for this project.",
+              ...(restartNote ? [restartNote] : []),
+            ].join("\n"),
+          );
         }
         if (command === "start") {
-          const result = await ensureChief(args.one("project") ?? context.projectId ?? undefined);
+          const projectId = args.one("project") ?? context.projectId ?? (await settings.get()).chiefProject;
+          if (projectId) clearChiefRestart(projectId);
+          const result = await ensureChief(projectId ?? undefined);
           return ok(result, `${result.created ? "Started" : "Using"} Chief thread ${result.threadId}.`);
         }
         if (command === "create") {
           const projectId = args.one("project") ?? context.projectId ?? (await settings.get()).chiefProject;
           if (!projectId) return fail("create requires --project outside a project thread");
+          clearChiefRestart(projectId);
           const result = await createChief(projectId);
           return ok(result, `Created Chief thread ${result.threadId}.`);
         }
@@ -1060,7 +1186,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
   const initial = await settings.get();
   if (initial.chiefProject) {
-    void ensureChief(initial.chiefProject).catch((error) => bb.log.warn(`Could not auto-start Chief: ${String(error)}`));
+    void autoStartChief(initial.chiefProject);
   }
   bb.log.info("Chief supervisor loaded");
 }
